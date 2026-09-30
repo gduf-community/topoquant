@@ -23,7 +23,7 @@ class PipelineConfig:
     min_windows: int = 4
     features: tuple[str, ...] = ("money", "volume", "high", "close")
     max_edge_length: float = 3.0
-    max_homology_dimension: int = 2
+    max_homology_dimension: int = 1
     distance_dimensions: tuple[int, int] = (0, 1)
     distance_threshold: float = 0.1
     top_k: int = 5
@@ -71,7 +71,7 @@ class PipelineConfig:
             min_windows=int(raw.get("min_windows", 4)),
             features=tuple(raw.get("features", ["money", "volume", "high", "close"])),
             max_edge_length=float(raw.get("max_edge_length", 3.0)),
-            max_homology_dimension=int(raw.get("max_homology_dimension", 2)),
+            max_homology_dimension=int(raw.get("max_homology_dimension", 1)),
             distance_dimensions=tuple(raw.get("distance_dimensions", [0, 1])),
             distance_threshold=float(raw.get("distance_threshold", 0.1)),
             top_k=int(raw.get("top_k", 5)),
@@ -97,8 +97,8 @@ class PipelineConfig:
             raise ConfigError("features 不能为空或重复")
         if self.max_edge_length <= 0:
             raise ConfigError("max_edge_length 必须大于 0")
-        if self.max_homology_dimension < 1:
-            raise ConfigError("max_homology_dimension 必须至少为 1")
+        if self.max_homology_dimension != 1:
+            raise ConfigError("当前实验只计算 H0/H1，请将 max_homology_dimension 设为 1")
         if self.distance_dimensions != (0, 1):
             raise ConfigError("当前实验契约要求 distance_dimensions 固定为 [0, 1]")
         if self.distance_threshold <= 0:
@@ -165,7 +165,7 @@ class PipelineConfig:
 
     def topology_signature(self) -> str:
         topology_fields = {
-            "persistence_backend": "ripser-0.6-v1",
+            "persistence_backend": "polars-tda-0.1.0-exact-f2-truncated-inf-v2",
             "source_dir": str(self.source_dir),
             "as_of_date": self.as_of_date.isoformat(),
             "window_size": self.window_size,
@@ -186,8 +186,8 @@ class PipelineConfig:
             "top_k": self.top_k,
             "matching_pivots": self.matching_pivots,
             # 距离语义版本：改变距离定义时必须递增，否则旧结果会被误当成有效缓存。
-            # Ripser 生成持续图；Topp 0.1.0 计算有限部分，本质类按 birth 精确配对。
-            "distance_algo": "topp-0.1.0-exact-pivot-threshold-v6",
+            # polars-tda/cocycle 计算有限部分，+inf 端点按 birth 精确配对。
+            "distance_algo": "polars-tda-cocycle-exact-pivot-threshold-v7",
         }
         payload = json.dumps(fields, sort_keys=True).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()

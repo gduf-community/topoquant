@@ -12,8 +12,8 @@ dependencies = [
   "numpy>=1.24,<3",
   "pandas>=2.0,<4",
   "rich>=13,<14",
-  "ripser>=0.6,<0.7",
-  "topp==0.1.0",
+  "polars==1.44.2",
+  "polars-tda>=0.1.0,<0.2",
 ]
 
 [project.optional-dependencies]

@@ -27,10 +27,12 @@ $BuildPath = Join-Path $ProjectRoot "build\pyinstaller"
     --name "TopoQuant" `
     --contents-directory "runtime" `
     --paths (Join-Path $ProjectRoot "src") `
-    --collect-all "topp" `
-    --collect-all "ripser" `
-    --copy-metadata "topp" `
-    --copy-metadata "ripser" `
+    --collect-all "polars_tda" `
+    --collect-all "polars" `
+    --collect-all "_polars_runtime_32" `
+    --copy-metadata "polars-tda" `
+    --copy-metadata "polars" `
+    --copy-metadata "polars-runtime-32" `
     --copy-metadata "numpy" `
     --copy-metadata "pandas" `
     --copy-metadata "rich" `

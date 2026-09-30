@@ -1,6 +1,8 @@
 # TopoQuant Windows 便携版
 
-这个目录已经包含 Python、NumPy、pandas、Ripser、Topp 和程序本身。目标电脑不需要安装 Python、Visual Studio、Jupyter、CUDA 或数据库。
+> 打包前先从 `plugins/polars-tda` 克隆构建并安装本地 wheel，见[内核接入说明](BOTTLENECK_KERNEL.md)。便携包仍需通过两个真实自检后交付。
+
+这个目录已经包含 Python、NumPy、pandas、Polars、polars-tda 和程序本身。目标电脑不需要安装 Python、Visual Studio、Jupyter、CUDA 或数据库。
 
 ## 第一次使用
 
@@ -36,7 +38,7 @@ EventDate,money,volume,high,close,prev_close
 
 设置保存在外置 `config.json` 中，下次启动会自动作为默认值。也可以用文本编辑器直接修改它。同一个基准日期如果更改实验协议或行情输入，交互程序会保留旧实验并自动创建递增的 `work_dir`（如 `runs/20240628_2`），这样不同实验可以并排比较。
 
-当前固定在程序里的算法定义包括：总体标准差 Z-score、Ripser 持续同调、Topp exact Bottleneck 距离、H0/H1 双阈值筛选和多数投票。`distance_dimensions` 因此必须保持 `[0, 1]`。若要修改这些公式、距离维度或算法，需要在开发电脑修改源码、运行测试并重新生成便携包；目标电脑无需承担编译。
+当前固定在程序里的算法定义包括：总体标准差 Z-score、polars-tda 持续同调与 exact Bottleneck 距离、H0/H1 双阈值筛选和多数投票。`distance_dimensions` 因此必须保持 `[0, 1]`。若要修改这些公式、距离维度或算法，需要在开发电脑修改源码、运行测试并重新生成便携包；目标电脑无需承担编译。
 
 ## 老电脑建议
 
@@ -70,4 +72,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_portable.ps1
 .\scripts\build_portable.ps1 -WithoutData
 ```
 
-输出目录是 `dist\TopoQuant\`。构建脚本会运行真实的 Ripser 和瓶颈距离自检；只有自检通过的目录才应交付。
+输出目录是 `dist\TopoQuant\`。构建脚本会运行真实的 polars-tda 持续同调和瓶颈距离自检；只有自检通过的目录才应交付。

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
-import venv
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -30,7 +31,7 @@ DATA_DIR = PROJECT_ROOT / "data" / "stock"
 PYTHON_MIN = (3, 10)
 PYTHON_MAX = (4, 0)   # 不设上限，由 pip 与科学计算 wheel 可用性自然约束
 
-CORE_PACKAGES = ("ripser", "topp", "numpy", "pandas", "rich")
+CORE_PACKAGES = ("polars", "polars_tda", "numpy", "pandas", "rich")
 UV_AVAILABLE = False  # 运行时动态检测
 
 # ── 颜色 ──────────────────────────────────────────────
@@ -150,14 +151,19 @@ def check_venv() -> EnvStatus:
     if not py_path.is_file():
         return EnvStatus(False, f".venv 不存在（缺少 {py_path.name}）", None)
 
-    # 1b. pip 是否可用
-    pip_check = run_venv(["-m", "pip", "--version"])
-    if pip_check.returncode != 0:
-        return EnvStatus(False, "pip 不可用", str(py_path))
+    # uv 创建的环境可以没有 pip；先确认解释器本身可运行。
+    try:
+        probe = run_venv(["-c", "import sys; print(sys.version)"], timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return EnvStatus(False, f".venv 解释器不可用: {exc}", str(py_path))
+    if probe.returncode != 0:
+        detail = probe.stderr.strip() or probe.stdout.strip()
+        return EnvStatus(False, f".venv 解释器不可用: {detail}", str(py_path))
 
     # 1c. 五个核心包是否可 import
     for pkg in CORE_PACKAGES:
-        result = run_venv(["-c", f"import {pkg}"])
+        code = "from polars_tda import rips, finite_bottleneck_distance" if pkg == "polars_tda" else f"import {pkg}"
+        result = run_venv(["-c", code])
         if result.returncode != 0:
             return EnvStatus(False, f"缺少依赖包: {pkg}", str(py_path))
 
@@ -226,65 +232,51 @@ def discover_python_versions() -> list[PythonVersion]:
     constraint = _read_python_requires()
 
     # 尝试 py --list-paths
-    result = subprocess.run(
-        ["py", "--list-paths"],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["py", "--list-paths"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = subprocess.CompletedProcess(["py", "--list-paths"], 1, "", "")
 
-    versions: list[PythonVersion] = []
-
+    paths: list[Path] = []
     if result.returncode == 0:
-        # 解析输出:  -V:3.12          C:\Python312\python.exe
+        # 默认版本的星号位于版本和路径之间；版本标签也可能包含供应商名称。
         for line in result.stdout.splitlines():
-            m = re.match(
-                r"\s*-V:(\d+)\.(\d+)(?:\*)?\s+(.+?)(?:\s+\*(.*))?$",
-                line.strip(),
-            )
-            if not m:
-                continue
-            maj, min_, path_str = int(m.group(1)), int(m.group(2)), m.group(3).strip()
-            arch = (m.group(4) or "").strip()
-            if not arch:
-                arch = "64-bit"  # 默认
+            m = re.match(r"\s*-V:\S+\s+(?:\*\s+)?(.+?)\s*$", line)
+            if m:
+                paths.append(Path(m.group(1)))
 
-            path = Path(path_str)
-            if not path.is_file():
-                continue
-
-            ver = (maj, min_)
-            if not _version_in_range(f"{maj}.{min_}", constraint):
-                continue
-
-            # 确认这个 Python 真实存在且可运行
+    # 当前解释器可能未注册到 py；从 venv 启动时使用其基础解释器。
+    paths.insert(0, Path(getattr(sys, "_base_executable", sys.executable)))
+    versions: list[PythonVersion] = []
+    for path in dict.fromkeys(paths):
+        if not path.is_file():
+            continue
+        try:
             probe = subprocess.run(
-                [str(path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"],
-                capture_output=True, text=True,
+                [str(path), "-c", (
+                    "import json,sys,sysconfig; print(json.dumps(["
+                    "list(sys.version_info[:3]), sys.maxsize > 2**32]))"
+                )],
+                capture_output=True, text=True, timeout=20,
             )
             if probe.returncode != 0:
                 continue
-
-            full_ver = probe.stdout.strip()
+            version, is_64_bit = json.loads(probe.stdout)
+            full_ver = ".".join(map(str, version))
+            if not _version_in_range(full_ver, constraint):
+                continue
             versions.append(PythonVersion(
                 path=path,
                 version=full_ver,
-                major=maj,
-                minor=min_,
-                arch=arch,
+                major=version[0],
+                minor=version[1],
+                arch="64-bit" if is_64_bit else "32-bit",
             ))
-
-    # 如果没有 py launcher，检查当前 python
-    if not versions and sys.version_info[:2] >= PYTHON_MIN:
-        v = sys.version_info
-        arch = "64-bit" if sys.maxsize > 2**32 else "32-bit"
-        py_path = Path(sys.executable)
-        if _version_in_range(f"{v.major}.{v.minor}", constraint):
-            versions.append(PythonVersion(
-                path=py_path,
-                version=f"{v.major}.{v.minor}.{v.micro}",
-                major=v.major,
-                minor=v.minor,
-                arch=arch,
-            ))
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            continue
 
     # 按版本降序排列
     versions.sort(key=lambda x: (x.major, x.minor), reverse=True)
@@ -293,18 +285,57 @@ def discover_python_versions() -> list[PythonVersion]:
 
 # ── 第3步：创建 venv 并安装 ───────────────────────────
 
+def local_plugin_target(python: Path) -> Path | None:
+    """优先选择目标解释器兼容的本地 abi3 wheel，否则使用插件源码。"""
+    probe = subprocess.run(
+        [str(python), "-c", (
+            "import json,sys,sysconfig; print(json.dumps([sys.implementation.name, "
+            "sys.version_info[:2], sysconfig.get_platform().replace('-', '_').replace('.', '_'), "
+            "bool(sysconfig.get_config_var('Py_GIL_DISABLED'))]))"
+        )],
+        capture_output=True, text=True, timeout=20, check=True,
+    )
+    implementation, version, platform_tag, free_threaded = json.loads(probe.stdout)
+    wheel_dir = PROJECT_ROOT / "build" / "polars-tda-wheels"
+    if implementation == "cpython" and version[0] == 3 and not free_threaded:
+        for wheel in sorted(wheel_dir.glob("polars_tda-*.whl"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
+            match = re.fullmatch(r"polars_tda-.+-cp3(\d+)-abi3-(.+)\.whl", wheel.name)
+            if match and int(match[1]) <= version[1] and match[2] == platform_tag:
+                return wheel
+    source = PROJECT_ROOT / "plugins" / "polars-tda"
+    return source if (source / "pyproject.toml").is_file() else None
+
+
 def create_and_install(python: PythonVersion) -> bool:
     """用指定 Python 创建 .venv + 安装项目依赖（有 uv 则优先用 uv）。"""
     global UV_AVAILABLE
     uv_ver = check_uv()
     UV_AVAILABLE = uv_ver is not None
+    install_targets = ["-e", "."]
+    try:
+        local_plugin = local_plugin_target(python.path)
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        print(f"\n{err('Python 平台检测失败: ' + detail.strip())}")
+        return False
+    if local_plugin is not None:
+        install_targets.append(str(local_plugin))
+        print(f"  {info('使用本地 polars-tda 插件:')} {local_plugin}")
+
+    installer_env = dict(os.environ)
+    installer_env.setdefault("UV_CACHE_DIR", str(PROJECT_ROOT / "build" / "uv-cache"))
 
     sep("创建虚拟环境")
 
-    # 如已有旧的 .venv，先删除
+    # 保留旧环境，避免修复失败时丢失已安装包；不触碰实验数据。
     if VENV_DIR.exists():
-        print(f"  {hint('移除旧 .venv ...')}")
-        shutil.rmtree(VENV_DIR, ignore_errors=True)
+        project_root = PROJECT_ROOT.resolve()
+        backup = project_root / "build" / f"venv-backup-{datetime.now():%Y%m%d-%H%M%S-%f}"
+        if VENV_DIR.resolve() != project_root / ".venv" or not backup.resolve().is_relative_to(project_root):
+            raise RuntimeError("拒绝移动项目目录之外的虚拟环境")
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        VENV_DIR.rename(backup)
+        print(f"  {hint('旧环境已备份:')} {backup}")
 
     print(f"  {info('Python:')} {python.label}")
 
@@ -317,6 +348,7 @@ def create_and_install(python: PythonVersion) -> bool:
             capture_output=True, text=True,
             cwd=str(PROJECT_ROOT),
             timeout=60,
+            env=installer_env,
         )
         if uv_create.returncode != 0:
             print(f"\n{err('uv venv 失败: ' + uv_create.stderr.strip()[-300:])}")
@@ -331,11 +363,11 @@ def create_and_install(python: PythonVersion) -> bool:
         # uv pip install 并行加速
         sep("安装依赖（uv 并行加速）")
         install = subprocess.run(
-            ["uv", "pip", "install", "-e", "."],
+            ["uv", "pip", "install", "--python", str(py), *install_targets],
             capture_output=True, text=True,
             cwd=str(PROJECT_ROOT),
-            timeout=600,
-            env={**__import__("os").environ, "VIRTUAL_ENV": str(VENV_DIR)},
+            timeout=1800,
+            env=installer_env,
         )
         installer_name = "uv pip"
     else:
@@ -343,12 +375,13 @@ def create_and_install(python: PythonVersion) -> bool:
         print(f"  {hint('建议安装: pip install uv  或  winget install astral-sh.uv')}")
         print(f"  {hint('创建 .venv ...')}")
 
-        builder = venv.EnvBuilder(
-            with_pip=True,
-            upgrade_deps=True,
-            clear=True,
+        creation = subprocess.run(
+            [str(python.path), "-m", "venv", "--upgrade-deps", str(VENV_DIR)],
+            capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=300,
         )
-        builder.create(str(VENV_DIR))
+        if creation.returncode != 0:
+            print(f"\n{err('venv 创建失败: ' + creation.stderr.strip()[-300:])}")
+            return False
 
         py = get_venv_python()
         if not py.is_file():
@@ -359,19 +392,19 @@ def create_and_install(python: PythonVersion) -> bool:
         sep("安装依赖")
         print(f"  {hint('pip install -e .  (可能需要几分钟)...')}")
         install = subprocess.run(
-            [str(py), "-m", "pip", "install", "-e", "."],
+            [str(py), "-m", "pip", "install", *install_targets],
             capture_output=True, text=True,
             cwd=str(PROJECT_ROOT),
-            timeout=600,
+            timeout=1800,
         )
         installer_name = "pip"
 
     if install.returncode != 0:
         print(f"\n{err(f'{installer_name} install 失败')}")
         print(f"  {c(install.stderr.strip()[-500:], C['D'])}")
-        if "ripser" in install.stderr.lower() or "topp" in install.stderr.lower():
-            print(f"\n  {warn('Ripser/Topp 可能没有当前 Python 版本的可用 wheel')}")
-            print(f"  {hint('建议换一个 Python 版本重试（如 3.11 或 3.12）')}")
+        if "polars" in install.stderr.lower():
+            print(f"\n  {warn('polars-tda/Polars 可能尚未发布当前平台的可用 wheel')}")
+            print(f"  {hint('可按 docs/BOTTLENECK_KERNEL.md 克隆并构建本地插件；源码构建需要 Rust 和 C++ 链接工具')}")
             others = [v for v in discover_python_versions() if v.path != python.path]
             if others:
                 print(f"\n  {c('其他可用 Python 版本:', C['B'])}")
@@ -393,7 +426,8 @@ def full_validation() -> bool:
 
     # 检查包版本
     for pkg in CORE_PACKAGES:
-        result = run_venv(["-c", f"import {pkg}"])
+        code = "from polars_tda import rips, finite_bottleneck_distance" if pkg == "polars_tda" else f"import {pkg}"
+        result = run_venv(["-c", code])
         if result.returncode == 0:
             ver = _get_package_version(pkg)
             print(f"  {ok(pkg + ' ' + ver)}")

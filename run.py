@@ -22,7 +22,8 @@ _PROJECT_ROOT = (
 _VENV_PYTHON = _PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 
 if (
-    not _FROZEN
+    __name__ == "__main__"
+    and not _FROZEN
     and _VENV_PYTHON.is_file()
     and Path(sys.executable).resolve() != _VENV_PYTHON.resolve()
 ):
@@ -40,11 +41,11 @@ if (
         )
     except _sp.TimeoutExpired:
         print("\033[31m\n错误: .venv 解释器启动超时（>20s），可能是运行时 DLL 卡死。")
-        print(f"请执行: cd {_PROJECT_ROOT} && .venv\\Scripts\\python setup_env.py\033[0m")
+        print(f'请执行: & "{sys.executable}" "{_PROJECT_ROOT / "setup_env.py"}"\033[0m')
         sys.exit(1)
     if _probe.returncode != 0:
         print("\033[31m\n错误: .venv 解释器不可用。")
-        print(f"请执行: cd {_PROJECT_ROOT} && python setup_env.py\033[0m")
+        print(f'请执行: & "{sys.executable}" "{_PROJECT_ROOT / "setup_env.py"}"\033[0m')
         sys.exit(1)
 
     # 探针通过后转交实际运行 —— 流水线可能跑几十分钟，绝不能加超时。
@@ -117,7 +118,7 @@ DEFAULTS: dict[str, Any] = {
     "min_windows": 4,
     "features": ["money", "volume", "high", "close"],
     "max_edge_length": 3.0,
-    "max_homology_dimension": 2,
+    "max_homology_dimension": 1,
     "distance_dimensions": [0, 1],
     "distance_threshold": 0.1,
     "top_k": 5,
@@ -300,7 +301,9 @@ def collect_params(defaults: dict[str, Any]) -> dict[str, Any]:
     _sep("特征与拓扑")
     params["features"] = prompt_list("特征列", list(defaults["features"]), "逗号分隔，如 money,volume,high,close")
     params["max_edge_length"] = prompt_float("VR复形最大边长", float(defaults["max_edge_length"]), "通常 2.0~5.0")
-    params["max_homology_dimension"] = prompt_int("最大同调维度", int(defaults["max_homology_dimension"]), "2 = H0/H1/H2")
+    # 匹配和预测只使用 H0/H1，不计算或保存未使用的 H2。
+    params["max_homology_dimension"] = 1
+    print(f"  {_hint('同调维度固定为 1：只计算 H0/H1')}")
 
     # ── 第4组：匹配参数 ──
     _sep("匹配参数")
@@ -492,8 +495,8 @@ def main() -> None:
     # 原因: 持续同调后端包含本地扩展，导入异常有时无法由普通 try/except
     #       稳定捕获。用子进程+超时检测。
     _DEP_CHECKS = [
-        ("ripser", "持续同调计算", "pip install ripser"),
-        ("topp",   "瓶颈距离", "pip install topp==0.1.0"),
+        ("polars", "列式计算", "pip install polars==1.44.2"),
+        ("polars_tda", "拓扑计算内核", "pip install -e ."),
         ("numpy",  "数组与标准化",
          "pip install numpy"),
         ("pandas", "CSV 与数据处理",
@@ -506,10 +509,14 @@ def main() -> None:
     for _pkg, _desc, _fix in _DEP_CHECKS:
         print(f"  {_hint(f'检查 {_pkg} ({_desc}) ...')}", end="", flush=True)
         try:
+            _probe_code = (
+                "from polars_tda import rips, finite_bottleneck_distance"
+                if _pkg == "polars_tda" else f"import {_pkg}"
+            )
             _probe_command = (
                 [sys.executable, "--dependency-probe", _pkg]
                 if _FROZEN
-                else [sys.executable, "-c", f"import {_pkg}"]
+                else [sys.executable, "-c", _probe_code]
             )
             _check = subprocess.run(
                 _probe_command,
@@ -542,7 +549,7 @@ def main() -> None:
     _IMPORT_STEPS = [
         ("topoquant.config",    "配置管理"),
         ("topoquant.cli",       "终端界面"),
-        ("topoquant.pipeline",  "流水线引擎（Ripser + Topp 距离）"),
+        ("topoquant.pipeline",  "流水线引擎（polars-tda）"),
         ("topoquant.preflight", "环境检测"),
         ("rich.console",        "Rich 控制台"),
         ("rich.progress",       "Rich 进度条"),
@@ -742,7 +749,10 @@ def _run_special_mode() -> int | None:
     if len(sys.argv) == 3 and sys.argv[1] == "--dependency-probe":
         import importlib
 
-        importlib.import_module(sys.argv[2])
+        module = importlib.import_module(sys.argv[2])
+        if sys.argv[2] == "polars_tda":
+            getattr(module, "rips")
+            getattr(module, "finite_bottleneck_distance")
         return 0
 
     if len(sys.argv) == 2 and sys.argv[1] == "--portable-self-test":
@@ -754,12 +764,12 @@ def _run_special_mode() -> int | None:
             [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             dtype=np.float64,
         )
-        diagrams = compute_persistence(points, 2.0, 2)
+        diagrams = compute_persistence(points, 2.0, 1)
         distance = bottleneck_distance(
             np.array([[0.0, 1.0]]),
             np.array([[0.0, 1.2]]),
         )
-        if set(diagrams) != {0, 1, 2} or not 0.19 <= distance <= 0.21:
+        if set(diagrams) != {0, 1} or not 0.19 <= distance <= 0.21:
             raise RuntimeError("便携版拓扑后端自检结果异常")
         print(f"TopoQuant portable self-test passed: {_PROJECT_ROOT}")
         return 0

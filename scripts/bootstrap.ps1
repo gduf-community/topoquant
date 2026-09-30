@@ -71,7 +71,14 @@ if ($Wheelhouse) {
 } else {
     & $VenvPython -m pip install --upgrade pip setuptools wheel
     if ($LASTEXITCODE -ne 0) { throw "pip bootstrap failed" }
-    & $VenvPython -m pip install -e $InstallTarget
+    $InstallArguments = @("-e", $InstallTarget)
+    $LocalPlugin = & $VenvPython -c "import sys; from pathlib import Path; from setup_env import local_plugin_target; print(local_plugin_target(Path(sys.executable)) or '')"
+    if ($LASTEXITCODE -ne 0) { throw "Local plugin selection failed" }
+    if ($LocalPlugin) {
+        $InstallArguments += $LocalPlugin
+        Write-Output "Using local polars-tda plugin: $LocalPlugin"
+    }
+    & $VenvPython -m pip install @InstallArguments
 }
 if ($LASTEXITCODE -ne 0) { throw "Project dependency installation failed" }
 

@@ -7,7 +7,7 @@
   "min_windows": 4,
   "features": ["money", "volume", "high", "close"],
   "max_edge_length": 3.0,
-  "max_homology_dimension": 2,
+  "max_homology_dimension": 1,
   "distance_dimensions": [0, 1],
   "distance_threshold": 0.1,
   "top_k": 5,

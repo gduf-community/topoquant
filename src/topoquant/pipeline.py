@@ -890,7 +890,7 @@ def _mmap_handle(path: str) -> np.ndarray:
 
 
 def _mmap_pairs(block: np.ndarray, row: int, count: int) -> np.ndarray:
-    """从 mmap 中取出有限持久对，拷贝成 C 连续数组交给 Topp。"""
+    """从 mmap 中取出有限持久对，交给 polars-tda/cocycle。"""
     points = block[row, :count, :]
     finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
     return np.ascontiguousarray(points[finite], dtype=np.float64)
@@ -939,7 +939,7 @@ def _pivot_signature(
 ) -> str:
     candidate_hash = hashlib.sha256("\n".join(candidate_ids).encode("utf-8")).hexdigest()[:16]
     return (
-        f"{_compute_source_signature(config)}:pivot-v3:topp-0.1.0-exact:"
+        f"{_compute_source_signature(config)}:pivot-v4:polars-tda-cocycle-exact:"
         f"dims={dimensions}:candidates={candidate_hash}:count={pivot_count}"
     )
 

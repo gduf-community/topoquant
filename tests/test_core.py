@@ -2,21 +2,32 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from dataclasses import replace
 from datetime import date
+from itertools import permutations
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from topoquant.config import PipelineConfig
+from topoquant.config import ConfigError, PipelineConfig
 from topoquant.data import iter_cloud_windows, load_future_directions, standardized_points
-from topoquant.pipeline import _exact_bottleneck, match_clouds, run_all
+from topoquant.pipeline import _exact_bottleneck, _pivot_signature, match_clouds, run_all
 from topoquant.preflight import inspect_environment, inspect_results
 from topoquant.storage import ExperimentIdentityError, check_or_set_identity, connect
-from topoquant.topology import bottleneck_distance, compute_persistence, finite_bottleneck_distance
+from topoquant.topology import TopologyError, bottleneck_distance, compute_persistence, finite_bottleneck_distance
 from topoquant.validation import validate_dataset
+
+
+@pytest.fixture
+def native_tda():
+    tda = pytest.importorskip("polars_tda", reason="等待 polars-tda 发行包")
+    if not hasattr(tda, "finite_bottleneck_distance"):
+        pytest.skip("当前 polars-tda 尚未包含 Rust 距离绑定")
+    return tda
 
 
 def make_stock(path: Path, rows: int = 12) -> None:
@@ -49,6 +60,20 @@ def test_identity_mismatch_has_specific_error(tmp_path: Path) -> None:
 
         with pytest.raises(ExperimentIdentityError, match="新的 work_dir"):
             check_or_set_identity(db, "topology-new", "source", {})
+
+
+def test_pipeline_requires_only_h0_h1_and_invalidates_h2_signature(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "source_dir": "stock", "work_dir": "work", "as_of_date": "2024-06-28",
+    }), encoding="utf-8")
+    config = PipelineConfig.from_json(config_path)
+    assert config.max_homology_dimension == 1
+    assert PipelineConfig(tmp_path, tmp_path / "work", date(2024, 6, 28)).max_homology_dimension == 1
+    legacy = replace(config, max_homology_dimension=2)
+    assert legacy.topology_signature() != config.topology_signature()
+    with pytest.raises(ConfigError, match="只计算 H0/H1"):
+        legacy.validate()
 
 
 def test_windows_are_non_overlapping_and_newest_first(tmp_path: Path) -> None:
@@ -119,6 +144,12 @@ def test_automatic_worker_counts_follow_cpu_count(monkeypatch, tmp_path: Path) -
 
 def test_preflight_builds_runtime_plan(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("topoquant.config.os.cpu_count", lambda: 12)
+    monkeypatch.setattr("topoquant.preflight._dependency_versions", lambda: {
+        name: "test" for name in ("numpy", "pandas", "rich", "polars", "polars-tda")
+    })
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(
+        rips=lambda: None, finite_bottleneck_distance=lambda: None
+    ))
     source = tmp_path / "stock"
     source.mkdir()
     make_stock(source / "000001.SZ.csv")
@@ -190,7 +221,7 @@ def test_schema_v1_adds_log_return_column_without_dropping_database(tmp_path: Pa
         ).fetchone()[0] == "2"
 
 
-def test_small_pipeline_reaches_report(tmp_path: Path) -> None:
+def test_small_pipeline_reaches_report(tmp_path: Path, native_tda) -> None:
     source = tmp_path / "stock"
     source.mkdir()
     dates = pd.bdate_range("2024-01-01", periods=24)
@@ -235,7 +266,10 @@ def test_small_pipeline_reaches_report(tmp_path: Path) -> None:
     index = json.loads((config.work_dir / "diagram_index.json").read_text(encoding="utf-8"))
     assert len(index) == result["topology"]["mmap_diagrams"] == 6
     counts = np.load(config.work_dir / "diagram_counts.npy", mmap_mode="r")
-    assert counts.shape == (6, config.max_homology_dimension + 1)
+    assert counts.shape == (6, 2)
+    assert not (config.work_dir / "diagrams_h2.npy").exists()
+    with connect(config.database_path) as db:
+        assert {row[0] for row in db.execute("SELECT DISTINCT dimension FROM diagrams")} == {0, 1}
     for dimension in range(config.max_homology_dimension + 1):
         block = np.load(config.work_dir / f"diagrams_h{dimension}.npy", mmap_mode="r")
         assert block.shape[0] == 6 and block.shape[2] == 2
@@ -298,16 +332,17 @@ def test_small_pipeline_reaches_report(tmp_path: Path) -> None:
     assert saved_matches() == pivot_matches
 
 
-def test_ripser_persistence_returns_requested_dimensions() -> None:
-    pytest.importorskip("ripser")
+def test_polars_tda_persistence_returns_requested_dimensions(native_tda) -> None:
     points = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
     diagrams = compute_persistence(points, max_edge_length=2.0, max_homology_dimension=2)
     assert set(diagrams) == {0, 1, 2}
     assert all(diagram.ndim == 2 and diagram.shape[1] == 2 for diagram in diagrams.values())
     assert np.isposinf(diagrams[0][:, 1]).sum() == 1
+    np.testing.assert_allclose(diagrams[1], [[1.0, np.sqrt(2.0)]])
+    assert diagrams[2].shape == (0, 2)
 
 
-def test_exact_bottleneck_preserves_full_diagram_semantics() -> None:
+def test_exact_bottleneck_preserves_full_diagram_semantics(native_tda) -> None:
     def split(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
         essential = np.isfinite(points[:, 0]) & ~np.isfinite(points[:, 1])
@@ -349,15 +384,136 @@ def test_empty_diagram_semantics_are_separated() -> None:
     assert finite_bottleneck_distance(empty, one) == pytest.approx(0.5)
 
 
-def test_topp_bottleneck_matches_gudhi_exact_oracle() -> None:
-    gd = pytest.importorskip("gudhi")
-
+def test_polars_tda_bottleneck_matches_exhaustive_matching(native_tda) -> None:
+    # 小图穷举增强二分图的全部匹配，不依赖其他 TDA 库作 oracle。
     rng = np.random.default_rng(20260811)
-    for left_size, right_size in ((1, 1), (8, 5), (24, 31), (60, 59)):
+    for left_size, right_size in ((1, 1), (1, 3), (3, 2), (3, 3)):
         left_birth = rng.uniform(-1.0, 1.0, left_size)
         right_birth = rng.uniform(-1.0, 1.0, right_size)
         left = np.column_stack((left_birth, left_birth + rng.uniform(0.0, 2.0, left_size)))
         right = np.column_stack((right_birth, right_birth + rng.uniform(0.0, 2.0, right_size)))
         actual = finite_bottleneck_distance(left, right)
-        expected = float(gd.bottleneck_distance(left, right, e=0.0))
-        assert actual == expected
+        size = left_size + right_size
+        cost = np.zeros((size, size))
+        cost[:left_size, :right_size] = np.max(
+            np.abs(left[:, None, :] - right[None, :, :]), axis=2
+        )
+        cost[:left_size, right_size:] = ((left[:, 1] - left[:, 0]) / 2)[:, None]
+        cost[left_size:, :right_size] = ((right[:, 1] - right[:, 0]) / 2)[None, :]
+        expected = min(
+            max(cost[row, column] for row, column in enumerate(order))
+            for order in permutations(range(size))
+        )
+        assert actual == pytest.approx(expected, abs=1e-14)
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_persistence_adapter_preserves_cutoff_contract(monkeypatch, schema_version) -> None:
+    import polars as pl
+
+    result = {
+        "schema_version": schema_version,
+        "max_dimension": 2,
+        "complete": False,
+        "through": 1.0,
+        "intervals": [
+            {"dimension": 0, "birth": 0.0, "death": 0.5, "end": "finite"},
+            {"dimension": 0, "birth": 0.0, "death": None, "end": "censored"},
+            {"dimension": 1, "birth": 1.0, "death": None, "end": "censored"},
+        ],
+    }
+
+    def rips(*coordinates, **options):
+        assert coordinates == ("x0", "x1")
+        assert options == {
+            "max_dimension": 2, "max_edge_length": 1.0,
+            "coefficient": 2, "method": "exact",
+        }
+        return pl.lit(result)
+
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(rips=rips))
+    actual = compute_persistence(np.array([[0, 0], [1, 1]]), 1.0, 2)
+    np.testing.assert_array_equal(actual[0], [[0.0, 0.5], [0.0, np.inf]])
+    np.testing.assert_array_equal(actual[1], [[1.0, np.inf]])
+    assert actual[2].shape == (0, 2)
+    assert all(a.dtype == np.float64 and a.flags.c_contiguous for a in actual.values())
+
+
+@pytest.mark.parametrize("end,death", [("unknown", None), ("finite", None), ("finite", -1.0)])
+def test_persistence_adapter_rejects_invalid_intervals(monkeypatch, end, death) -> None:
+    import polars as pl
+
+    result = {"schema_version": 2, "max_dimension": 1, "intervals": [
+        {"dimension": 0, "birth": 0.0, "death": death, "end": end}
+    ]}
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(rips=lambda *a, **kw: pl.lit(result)))
+    with pytest.raises(TopologyError, match="polars-tda 持续同调计算失败"):
+        compute_persistence(np.array([[0.0]]), 1.0, 1)
+
+
+def test_finite_distance_adapter_uses_rust_binding(monkeypatch) -> None:
+    def distance(left, right):
+        assert left == [[0.0, 2.0]]
+        assert right == [[0.0, 3.0]]
+        return 1.0
+
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(finite_bottleneck_distance=distance))
+    assert finite_bottleneck_distance(
+        np.array([[0.0, 2.0], [2.0, 2.0]]), np.array([[0.0, 3.0]])
+    ) == 1.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -1.0])
+def test_finite_distance_rejects_invalid_backend_result(monkeypatch, value) -> None:
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(
+        finite_bottleneck_distance=lambda left, right: value
+    ))
+    with pytest.raises(TopologyError, match="非负有限数"):
+        finite_bottleneck_distance(np.array([[0., 1.]]), np.array([[0., 2.]]))
+
+
+def test_finite_distance_reports_missing_binding(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace())
+    with pytest.raises(TopologyError, match="Rust 绑定"):
+        finite_bottleneck_distance(np.array([[0., 1.]]), np.array([[0., 2.]]))
+
+
+@pytest.mark.parametrize("left", [np.array([[1., 0.]]), np.array([[0., np.nan]])])
+def test_finite_distance_rejects_invalid_input(left) -> None:
+    with pytest.raises(TopologyError):
+        finite_bottleneck_distance(left, np.empty((0, 2)))
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_preflight_reports_unavailable_polars_tda(monkeypatch, tmp_path, installed) -> None:
+    versions = {name: "test" for name in ("numpy", "pandas", "rich", "polars", "polars-tda")}
+    if not installed:
+        versions["polars-tda"] = None
+    monkeypatch.setattr("topoquant.preflight._dependency_versions", lambda: versions)
+    monkeypatch.setitem(sys.modules, "polars_tda", SimpleNamespace(rips=lambda: None))
+    config = PipelineConfig(tmp_path, tmp_path / "work", date(2024, 1, 1))
+    report = inspect_environment(config, require_source=False)
+    assert not report.ready
+    assert any("polars-tda" in error for error in report.errors)
+    assert inspect_environment(config, require_source=False, require_topology_backend=False).ready
+
+
+def test_kernel_migration_invalidates_topology_matching_and_pivots(monkeypatch, tmp_path) -> None:
+    config = PipelineConfig(Path("stock"), Path("work"), date(2024, 1, 1))
+    # 同一配置在迁移前实际生成的签名；防止旧持续图与匹配结果被静默复用。
+    old_topology = "bf001c16361277b8607879dd3fdb58b8cfdf3a482d8f0689d54db17dc1bf888d"
+    old_matching = "f0234cec62e6c3299fa012583a7d8ebc39c3f2e8c9c464fc5b25f2c10cac271b"
+    assert config.topology_signature() != old_topology
+    assert config.matching_signature() != old_matching
+    with connect(tmp_path / "artifacts.sqlite3") as db:
+        check_or_set_identity(db, old_topology, "source", {})
+        db.execute("INSERT INTO clouds VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   ("cloud", "2024-01-01", "000001.SZ", "stock.csv", 3, "complete", None))
+        db.execute("INSERT INTO diagrams VALUES (?, ?, ?, ?)", ("cloud", 0, 0, b""))
+        db.commit()
+        with pytest.raises(ExperimentIdentityError):
+            check_or_set_identity(db, config.topology_signature(), "source", {})
+        assert db.execute("SELECT COUNT(*) FROM diagrams").fetchone()[0] == 1
+    monkeypatch.setattr("topoquant.pipeline._compute_source_signature", lambda config: "source")
+    old_pivot = "source:pivot-v3:topp-0.1.0-exact:dims=(0, 1):candidates=e3b0c44298fc1c14:count=0"
+    assert _pivot_signature(config, (0, 1), (), 0) != old_pivot

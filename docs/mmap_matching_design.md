@@ -2,7 +2,7 @@
 
 > **状态说明（2026-08-09）**：mmap 与多进程结构已落地。当前实现把剪枝摘要预计算一次
 > 并持久化，使用 NumPy 整批执行本质类/持续度谱下界，再叠加持久化 pivot 三角下界；
-> 只有幸存候选才进入 Topp exact Bottleneck 距离，本质类仍按 birth 精确配对。本文后面的代码
+> 只有幸存候选才进入 polars-tda exact Bottleneck 距离，本质类仍按 birth 精确配对。本文后面的代码
 > 片段只用于说明 mmap 架构，具体实现以 `src/topoquant/pipeline.py` 为准。
 
 ## 目标
@@ -27,8 +27,7 @@ build_topology()
               │
               ├── diagrams_h0.npy   (N, max_pairs_h0, 2) float64 memmap
               ├── diagrams_h1.npy   (N, max_pairs_h1, 2) float64 memmap
-              ├── diagrams_h2.npy   (N, max_pairs_h2, 2) float64 memmap
-              ├── diagram_counts.npy (N, 3) int32 [h0_cnt,h1_cnt,h2_cnt]
+              ├── diagram_counts.npy (N, 2) int32 [h0_cnt,h1_cnt]
               └── diagram_index.json {cloud_id: array_row_index}
 
 match_clouds()
@@ -62,7 +61,7 @@ def _export_diagrams_to_mmap(config: PipelineConfig) -> dict[str, int]:
     import numpy as np
     from .storage import connect, load_diagrams
     
-    dims = list(range(config.max_homology_dimension + 1))  # [0,1,2]
+    dims = list(range(config.max_homology_dimension + 1))  # [0,1]
     
     with closing(connect(config.database_path)) as db:
         diagrams = load_diagrams(db, dims)
@@ -80,8 +79,8 @@ def _export_diagrams_to_mmap(config: PipelineConfig) -> dict[str, int]:
             default=0
         )
     
-    # 3. 写入 counts 文件：(N, 3) int32
-    counts = np.zeros((n_diagrams, 3), dtype=np.int32)
+    # 3. 写入 counts 文件：(N, 2) int32
+    counts = np.zeros((n_diagrams, len(dims)), dtype=np.int32)
     for i, cid in enumerate(sorted_ids):
         for dim_idx, dim in enumerate(dims):
             counts[i, dim_idx] = len(diagrams[cid].get(dim, np.empty((0,2))))
@@ -478,10 +477,9 @@ def _export_diagrams_to_mmap(config: PipelineConfig) -> dict[str, int]:
     
     产出文件（在 config.work_dir 下）:
       diagram_index.json   — {cloud_id: row_index} 映射
-      diagram_counts.npy   — (N, 3) int32, 每个 cloud 在 H0/H1/H2 的有效对数
+      diagram_counts.npy   — (N, 2) int32, 每个 cloud 在 H0/H1 的有效对数
       diagrams_h0.npy      — (N, max_pairs_h0, 2) float64
       diagrams_h1.npy      — (N, max_pairs_h1, 2) float64
-      diagrams_h2.npy      — (N, max_pairs_h2, 2) float64
     
     NaN 填充不足部分，counts 记录实际有效对数。
     
@@ -510,8 +508,8 @@ def _export_diagrams_to_mmap(config: PipelineConfig) -> dict[str, int]:
                 max_p = max(max_p, d.shape[0])
         max_pairs[dim] = max_p
     
-    # 写入 counts: (N, 3) int32
-    counts = np.zeros((n, 3), dtype=np.int32)
+    # 写入 counts: (N, 2) int32
+    counts = np.zeros((n, len(dims)), dtype=np.int32)
     for i, cid in enumerate(sorted_ids):
         for dim_idx, dim in enumerate(dims):
             d = all_diagrams[cid].get(dim)

@@ -1,0 +1,149 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 53343e9..3732b45 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@ under the next development section. The project currently has a pre-alpha API.
+ 
+ ## Unreleased
+ 
++- Add the scalar `finite_bottleneck_distance` Python binding to the existing
++  cocycle exact distance solver. It accepts finite positive-lifetime pairs,
++  preserves multiplicity and releases the GIL; it does not compare diagram Structs.
+ - Replace the development branch's Git-pinned kernel with the exact published
+   crates.io dependency `cocycle = "=0.1.1"` and its registry checksum.
+ - Adapt diagram serialization to the kernel's logical interval iterator by using
+diff --git a/docs/advanced-api.md b/docs/advanced-api.md
+index ba5e815..e2e6dfc 100644
+--- a/docs/advanced-api.md
++++ b/docs/advanced-api.md
+@@ -64,8 +64,31 @@ zero-length finite intervals. An empty cloud yields an empty diagram
+ with the requested dimensions recorded as computed.
+ 
+ See [result schema](result-schema.md) for endpoint and coverage semantics.
+-Nested clouds, distance-matrix inputs, representatives and diagram distances
+-are not yet part of the public API.
++Nested clouds, distance-matrix inputs, representatives and distances between
++diagram Struct columns are not yet part of the public API.
++
++## Finite bottleneck distance
++
++`polars_tda.finite_bottleneck_distance(left, right)` computes the exact
++L-infinity bottleneck distance between two sequences of finite `(birth, death)`
++pairs, using the existing cocycle Rust solver. Lists and tuples are accepted;
++each pair must have finite endpoints and `birth < death`. Multiplicity is
++preserved. A point can match the diagonal at cost `(death - birth) / 2`.
++Two empty inputs have distance zero. Invalid intervals raise `ValueError`.
++
++This is a scalar helper, not a Polars expression or a consumer of `rips` Structs.
++It releases the GIL during native computation. It copies input pairs into Rust
++intervals and does not establish field, scale or filtration coverage compatibility.
++Callers must handle essential and censored intervals separately; dropping them
++does not establish the distance between the original complete diagrams.
++Exact means no algorithmic approximation, not exact real arithmetic.
++
++```python
++from polars_tda import finite_bottleneck_distance
++
++assert finite_bottleneck_distance([[0.0, 2.0]], [[0.0, 3.0]]) == 1.0
++assert finite_bottleneck_distance([[0.0, 2.0]], []) == 1.0
++```
+ 
+ ## Sparse Rips
+ 
+diff --git a/python/polars_tda/__init__.py b/python/polars_tda/__init__.py
+index c706435..97cc326 100644
+--- a/python/polars_tda/__init__.py
++++ b/python/polars_tda/__init__.py
+@@ -1,6 +1,13 @@
+ """Native topological data analysis expressions for Polars."""
+ 
+-from polars_tda._internal import __version__
++from polars_tda._internal import __version__, finite_bottleneck_distance
+ from polars_tda.expressions import betti_curve, features, lifetime_summary, rips
+ 
+-__all__ = ["__version__", "betti_curve", "features", "lifetime_summary", "rips"]
++__all__ = [
++    "__version__",
++    "betti_curve",
++    "features",
++    "finite_bottleneck_distance",
++    "lifetime_summary",
++    "rips",
++]
+diff --git a/python/polars_tda/_internal.pyi b/python/polars_tda/_internal.pyi
+index bda5b5a..248fe2a 100644
+--- a/python/polars_tda/_internal.pyi
++++ b/python/polars_tda/_internal.pyi
+@@ -1 +1,7 @@
++from collections.abc import Sequence
++
+ __version__: str
++
++def finite_bottleneck_distance(
++    left: Sequence[Sequence[float]], right: Sequence[Sequence[float]]
++) -> float: ...
+diff --git a/src/lib.rs b/src/lib.rs
+index 8c54759..bedf265 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,7 +10,38 @@ use pyo3_polars::PolarsAllocator;
+ #[global_allocator]
+ static ALLOCATOR: PolarsAllocator = PolarsAllocator::new();
+ 
++/// Exact L-infinity bottleneck distance between finite birth/death pairs.
++///
++/// Pairs must have finite endpoints and birth < death. Callers handle essential
++/// and censored endpoints explicitly; this function cannot certify coverage.
++#[pyfunction]
++fn finite_bottleneck_distance(
++    py: Python<'_>,
++    left: Vec<[f64; 2]>,
++    right: Vec<[f64; 2]>,
++) -> PyResult<f64> {
++    use cocycle::diagram::{Coverage, IntervalEnd, PersistenceDiagram, PersistenceInterval};
++    use pyo3::exceptions::PyValueError;
++
++    py.detach(move || {
++        let diagram = |pairs: Vec<[f64; 2]>| -> cocycle::Result<PersistenceDiagram> {
++            let intervals = pairs
++                .into_iter()
++                .map(|[birth, death]| {
++                    PersistenceInterval::new(0, birth, IntervalEnd::Finite(death))
++                })
++                .collect::<cocycle::Result<Vec<_>>>()?;
++            PersistenceDiagram::new(0, Coverage::Complete, intervals)
++        };
++        let compute = || -> cocycle::Result<f64> {
++            cocycle::diagram_distances::bottleneck_distance(&diagram(left)?, &diagram(right)?, 0)
++        };
++        compute().map_err(|error| PyValueError::new_err(error.to_string()))
++    })
++}
++
+ #[pymodule]
+ fn _internal(module: &Bound<'_, PyModule>) -> PyResult<()> {
++    module.add_function(wrap_pyfunction!(finite_bottleneck_distance, module)?)?;
+     module.add("__version__", env!("CARGO_PKG_VERSION"))
+ }
+diff --git a/tests/test_plugin.py b/tests/test_plugin.py
+index 278665c..d54dc4b 100644
+--- a/tests/test_plugin.py
++++ b/tests/test_plugin.py
+@@ -7,3 +7,17 @@ import polars_tda
+ 
+ def test_native_module_matches_distribution_version():
+     assert polars_tda.__version__ == version("polars-tda")
++
++
++def test_finite_bottleneck_distance():
++    import pytest
++
++    distance = polars_tda.finite_bottleneck_distance
++    assert distance([], []) == 0.0
++    assert distance([(0.0, 2.0)], []) == 1.0
++    assert distance([(0.0, 2.0)], [(0.0, 3.0)]) == 1.0
++    assert distance([[0.0, 2.0]], [[0.0, 3.0]]) == 1.0
++    assert distance([(0.0, 2.0)] * 2, [(0.0, 2.0)]) == 1.0
++    for pair in [(1.0, 0.0), (0.0, 0.0), (0.0, float("inf")), (float("nan"), 1.0)]:
++        with pytest.raises(ValueError):
++            distance([pair], [])

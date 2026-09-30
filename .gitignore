@@ -12,6 +12,9 @@ data/stock/*.csv
 config.json
 /uplooad_mlflow.py
 
+# 本地原生 Polars 插件克隆；固定提交与补丁见 docs/BOTTLENECK_KERNEL.md
+/plugins/polars-tda/
+
 # mmap 持久图中间产物（随 build 阶段重新生成，不入库）
 diagrams_h*.npy
 diagram_counts.npy

@@ -1,10 +1,10 @@
 # TopoQuant
 
-> 当前 Bottleneck 距离由公开 Python 包 [Topp](https://pypi.org/project/topp/0.1.0/) `0.1.0` 提供；历史 GUDHI/Hera 基准见 [Bottleneck 后端记录](docs/BOTTLENECK_KERNEL.md)。
+> 计算内核使用 [polars-tda](https://github.com/Aequiludium/polars-tda)：持续同调调用 `rips`，有限图距离调用其 cocycle Rust 绑定。当前采用 `plugins/polars-tda` 本地源码克隆和[距离绑定补丁](patches/polars-tda-finite-bottleneck.patch)，无需等待 PyPI 发版；克隆、构建和安装见[接入说明](docs/BOTTLENECK_KERNEL.md)。
 
 > 需要交付给没有 Python 环境的 Windows 电脑时，使用[便携版说明](docs/PORTABLE.md)。便携目录包含完整运行时，数据和 `config.json` 实验协议仍保持外置可修改。
 
-这是对 `quant260803.ipynb` 和 `第三次实验流程图.drawio` 的工程化实现。核心实验口径保持为：60 个交易日构成一个点云，使用 `money / volume / high / close` 四列的 Z-score 标准化数据构建 Vietoris–Rips 复形，保存 H0/H1/H2 持续同调结果，以 H0/H1 瓶颈距离进行历史类比，再用 Top-N 相似点云的未来走势多数投票。
+这是对 `quant260803.ipynb` 和 `第三次实验流程图.drawio` 的工程化实现。当前实验口径为：60 个交易日构成一个点云，使用 `money / volume / high / close` 四列的 Z-score 标准化数据构建 Vietoris–Rips 复形，只计算并保存 H0/H1 持续同调结果，以 H0/H1 瓶颈距离进行历史类比，再用 Top-N 相似点云的未来走势多数投票。原 notebook 中保存的 H2 没有参与匹配或预测，现已移除这部分计算。
 
 第一次运行可直接按照 [启动文档](docs/START.md) 操作；环境与离线部署细节见 [陌生机器安装与启动](docs/SETUP.md)，字段要求见 [行情数据契约](docs/DATA_CONTRACT.md)。仓库不附带商业行情数据；默认把原始 CSV 放在 `data/stock/`，实验产物写到 `runs/<截止日>/`。
 
@@ -12,7 +12,7 @@
 
 1. 从每支股票截至实验日的最近 480 个交易日中，按从新到旧切成最多 8 个、不重叠的 60 日窗口；至少有 4 个完整窗口的股票才进入实验。
 2. 每个窗口只在内存中抽取四个特征并做 Z-score 标准化。notebook 中先对 C-L 列做 Min-Max、随后又对四个特征做 Z-score；对非恒定列而言前一步不会改变最终 Z-score，因此不再保存归一化 CSV。
-3. 对每个窗口计算 H0/H1/H2。数值对写入 `artifacts.sqlite3`，不生成持续同调图，也不再生成 39318 个 TXT。
+3. 对每个窗口计算 H0/H1。数值对写入 `artifacts.sqlite3`，不生成持续同调图，也不再生成 39318 个 TXT。
 4. `cloud_date == as_of_date` 是目标点云，`cloud_date < as_of_date` 才是历史候选（不使用未来数据）。对 H0、H1 分别计算瓶颈距离，两个距离都严格小于阈值才合格。
 5. 合格历史点云数量不少于 `top_k` 时，按 H1 距离、H0 距离、点云 ID 稳定排序并保留前 `top_k`。
 6. 对目标及相似点云分别读取其窗口日期之后的 5 个交易日，以首个未来交易日的 `prev_close` 为基准计算累计涨跌；相似点云多数投票生成预测，并与目标真实方向比较。
@@ -23,7 +23,7 @@
 所有可恢复的计算状态集中在 `<work_dir>/artifacts.sqlite3`：
 
 - `clouds`：点云 ID、日期、股票代码、来源和处理状态；
-- `diagrams`：H0/H1/H2 的 birth-death 数值对，以紧凑的 `float64` 二进制保存；
+- `diagrams`：H0/H1 的 birth-death 数值对，以紧凑的 `float64` 二进制保存；
 - `match_runs` / `matches`：候选数、阈值内数量、Top-N 及两个距离；
 - `forecast_runs` / `forecasts`：未来日期、价差、实际对数收益率、方向、投票和预测正确性；
 - `metadata`：配置、输入文件指纹和阶段签名，防止把不同实验混进同一目录。
@@ -41,13 +41,17 @@
 
 ## 安装与运行
 
-当前支持 Python 3.10–3.14；Windows 上推荐 64 位 Python 3.11，其他版本仍取决于 Ripser/Topp 是否提供对应 wheel。复制并修改 `config.example.json`，然后在项目目录执行：
+项目要求 Python 3.10+；实际可用平台取决于 Polars 与插件的构建支持。先按[内核接入说明](docs/BOTTLENECK_KERNEL.md)准备本地插件 wheel 或源码，再在项目目录执行：
 
 ```powershell
-py -m venv .venv
-.venv\Scripts\python -m pip install -e .
-.venv\Scripts\topoquant --config config.example.json --verbose run
+python setup_env.py
+.\.venv\Scripts\python.exe run.py
 ```
+
+安装器优先使用 `build/polars-tda-wheels/` 中兼容的 wheel，没有时才从插件源码构建。
+已有环境可用时直接通过；需要重建时会将旧 `.venv` 保存在 `build/venv-backup-*`。
+`python` 命令不可用时，请使用基础解释器的完整路径，见[启动说明](docs/START.md)。
+命令行运行可使用 `.venv\Scripts\topoquant --config config.example.json --verbose run`。
 
 `run` 会先执行正式的预启动检查：现场检测逻辑内核、物理内存、工作盘空间、行情文件、实验库和依赖版本，计算本次实际并发数；存在阻断错误时不会进入计算。也可以只做预检：
 
@@ -98,7 +102,7 @@ py -m venv .venv
 
 ## 依赖取舍与性能
 
-持续同调由 Ripser 生成；有限持续图的 exact Bottleneck 距离由 Topp `0.1.0` 计算，其余直接依赖为 NumPy、pandas 和 Rich。外层空图、本质类和严格阈值语义保持不变。历史 GUDHI/Giotto/Hera 对比只作为研究证据保留，不再是运行时后端。
+持续同调和有限持续图的 exact Bottleneck 距离统一使用 polars-tda 的 cocycle Rust 内核，直接依赖为 polars-tda、Polars、NumPy、pandas 和 Rich。距离绑定补丁只导出已有 Rust 算法。外层空图、无穷端点和严格阈值语义保持不变；GUDHI/Ripser/Topp 均不再是运行或测试依赖，历史对比材料仅作为研究记录保留。
 
 三个计算阶段分别并发，配置值 `0` 表示根据机器逻辑内核数自动选择：
 
@@ -110,11 +114,11 @@ py -m venv .venv
 
 匹配阶段的历史持续同调数据以 `np.load(..., mmap_mode="r")` 只读映射进每个工作进程，由操作系统页缓存统一承载，不再按进程复制，因此提高 `matching_workers` 不会线性放大内存占用，自动上限从 4 提高到 16。
 
-匹配阶段采用“廉价下界 → pivot 三角下界 → Topp exact Bottleneck”的结构：
+匹配阶段采用“廉价下界 → pivot 三角下界 → polars-tda exact Bottleneck”的结构：
 
 1. H0/H1 的本质类个数、前 8 秩有限持续度谱和本质类 birth 下界通过 NumPy 整批筛选，不再逐候选执行 Python 判断；
 2. 默认选择 8 个 farthest-point pivots，持久化历史候选到 pivot 的精确 H0/H1 距离矩阵；查询时用 `max_j |d(Q,P_j)-d(H_i,P_j)|` 严格排除不可能满足阈值的候选；
-3. 只有剩余候选才调用 Topp 精确瓶颈距离，最终 H0/H1 `< threshold`、合格数量和 Top-K 排序语义不变。
+3. 只有剩余候选才调用 polars-tda 精确瓶颈距离，最终 H0/H1 `< threshold`、合格数量和 Top-K 排序语义不变。
 
 剪枝摘要和 pivot 矩阵保存在 `work_dir`，所有 worker 以 mmap 共享，避免每个进程重复扫描全部持续图。第一次 `match` 需要支付 `候选数 × pivot 数` 的离线精确距离成本，后续在源持续图、候选集合和 pivot 数不变时直接复用。`matching_pivots` 默认 8，可设为 0 禁用，允许范围 0–32。`match_runs.candidate_count` 表示全部下界剪枝后实际计算过 H0 距离的候选数。
 
@@ -127,9 +131,11 @@ py -m venv .venv
 - 预测还需要 `prev_close`；每个目标和相似点云在其日期之后必须恰好取得至少 5 个有效、无重复的交易日。
 - 用于预测期收益计算的 `prev_close` 和 `close` 必须为正数。单条策略对数收益率定义为 `(2 × predicted_direction - 1) × ln(close / baseline)`，其中 `baseline` 是首个未来交易日的 `prev_close`；汇总指标取等权平均。
 - 若 H0 或 H1 任一持续图为空，其瓶颈距离按无穷大处理，与原 notebook 的筛选行为一致。
-- 本质类（`death=+inf`）继续按既有语义精确处理：有限部分交给 Topp，本质类个数不同判为 `+inf`，个数相同时按 birth 降序逐位配对。
-- 距离语义已写入 `matching_signature`，Giotto 版本产生的匹配缓存不会被静默复用。
-- Pivot 只用于严格下界筛选，最终距离仍由 Topp 精确计算；单元测试会对拍启用/禁用 pivot 的最终匹配结果。
+- 本质类（`death=+inf`）继续按既有语义精确处理：有限部分交给 polars-tda，本质类个数不同判为 `+inf`，个数相同时按 birth 降序逐位配对。
+- polars-tda 在截断过滤中标记 `censored`；为保持原实验定义，适配层将它记为截断复形上的 `death=+inf`。这不表示它是完整过滤的本质类；现有 SQLite 数值对不保留两者区别。系数域显式为 F2，零长度有限区间由内核省略。
+- 拓扑、匹配和 pivot 签名已更新；旧内核结果不会被静默复用。交互入口保留旧目录并递增新目录，CLI 需要新 `work_dir` 或显式重建。
+- `max_homology_dimension` 固定为 `1`，不再计算或导出未使用的 H2。H1 计算仍包含杀死环所需的三角形。旧 H2 实验目录保留；维度变化会使缓存签名失配，交互入口自动递增目录。
+- Pivot 只用于严格下界筛选，最终距离仍由 polars-tda 精确计算；单元测试会对拍启用/禁用 pivot 的最终匹配结果。
 - 多数投票的门槛是 `floor(top_k / 2) + 1`；建议使用奇数 `top_k`。
 
 ## MLflow 实验记录
@@ -148,8 +154,18 @@ uv pip install --python .\.venv\Scripts\python.exe "mlflow==3.16.0"
 ## 测试
 
 ```powershell
-.venv\Scripts\python -m pip install -e ".[dev]"
+uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 .venv\Scripts\python -m pytest
 ```
 
-单元测试覆盖窗口顺序、标准化、未来涨跌基准、预启动检测、按内核自动选取并发数、进度事件、Ripser 的 H0/H1/H2 输出、Topp 有限距离与本质类精确语义、pivot 缓存及启用/禁用 pivot 的结果对拍，以及使用多进程/多线程的微型端到端流水线。GUDHI 仅作为可选差分 oracle。完整实盘验证仍需原始 `stock` 行情目录。
+uv 创建的环境可以没有 pip；若使用标准 venv/pip 安装，可用
+`.venv\Scripts\python -m pip install -e ".[dev]"` 安装测试依赖。
+
+单元测试覆盖窗口顺序、标准化、未来涨跌基准、预启动检测、按内核自动选取并发数、进度事件、polars-tda 的持续图适配、有限距离与无穷端点语义、只持久化 H0/H1 的完整流水线、pivot 缓存及启用/禁用 pivot 的结果对拍，以及使用多进程/多线程的微型端到端流水线。小图距离使用独立穷举匹配作 oracle。未安装包含距离绑定的 polars-tda 时，真实内核及端到端测试明确跳过；适配层测试使用返回值替身，不能代替发行包验证。完整实盘验证仍需原始 `stock` 行情目录。
+
+2026-09-30 已在 Windows x64 / Python 3.12 的独立环境中安装本地插件 Release wheel：
+TopoQuant 32 项测试全部通过、零跳过，插件自身 96 项测试全部通过。
+随后在实际入口使用的主 `.venv` 完成重建，43 项测试全部通过、零跳过；
+`setup_env.py` 重复运行、`run.py` 自动切换环境、交互启动和合成数据全流程自检均通过。
+移除 H2 后，主环境 45 项测试全部通过、零跳过，两个入口自检也通过。
+构建版本、wheel 路径和验证范围见[内核接入记录](docs/BOTTLENECK_KERNEL.md)。

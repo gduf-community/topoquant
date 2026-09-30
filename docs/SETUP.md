@@ -1,8 +1,10 @@
 # 陌生机器安装与启动
 
+> 优先使用 `build/polars-tda-wheels/` 中兼容的本地 wheel，否则从 `plugins/polars-tda` 克隆构建原生插件；固定提交、补丁及构建步骤见 [内核接入说明](BOTTLENECK_KERNEL.md)。
+
 ## 1. 支持边界
 
-推荐环境是 Windows 10/11 x64、PowerShell 5.1 或 7、64 位 Python 3.11。项目支持 Python 3.10–3.14；仍需按目标机器核对 Ripser 与科学计算 wheel 的可用性。
+推荐环境是 Windows 10/11 x64、PowerShell 5.1 或 7、64 位 Python 3.11。项目支持 Python 3.10–3.14；仍需按目标机器核对 polars-tda 与科学计算 wheel 的可用性。
 
 硬件建议：
 
@@ -13,7 +15,9 @@
 | 工作盘空间 | 原始 CSV 大小 + 2 GiB | 10 GiB 以上余量 | SQLite、日志和导出结果 |
 | 网络 | 首次安装需要 | 可用离线 wheelhouse | 下载 Python 包 |
 
-不需要安装 PostgreSQL、MySQL、Node.js、Jupyter、Java、CUDA 或 Visual Studio。SQLite 随 Python 自带。正常情况下 NumPy、pandas、Ripser 和 Topp 都通过 wheel 安装，不应在新机器上手工编译 C/C++。
+不需要安装 PostgreSQL、MySQL、Node.js、Jupyter、Java 或 CUDA。SQLite 随 Python 自带。
+使用构建好的 wheel 时无需编译工具；从本地克隆首次构建 polars-tda 时需要 Rust，Windows
+还需要 Visual Studio Build Tools 的 C++ 工具链及 Windows SDK。
 
 ## 2. Python 库
 
@@ -23,21 +27,22 @@
 |---|---|---|---|
 | NumPy | `>=1.24,<3` | 数组、标准化和持续同调数值对 | 否 |
 | pandas | `>=2,<4` | CSV、日期和行情表处理 | 否 |
-| Ripser | `>=0.6,<0.7` | Vietoris–Rips 持续同调 | 否 |
-| Topp | `==0.1.0` | exact Bottleneck 距离 | 否 |
+| Polars | `==1.44.2` | 原生插件的列式表达式运行时 | 否 |
+| polars-tda | `>=0.1.0,<0.2`，需距离绑定 | Vietoris–Rips 与 exact Bottleneck 的 Rust 内核 | 否 |
 | Rich | `>=13,<14` | 预检表格、进度条和结果终端界面 | 可替换，但当前 CLI 需要 |
 
 开发/测试额外使用 `pytest>=8,<10`。
 
 ## 3. 在线安装（推荐）
 
-先从 [Python 官方网站](https://www.python.org/downloads/windows/)安装 64 位 Python 3.11。建议勾选 Python Launcher。然后在项目根目录运行：
+先安装 64 位 Python，并按[内核接入说明](BOTTLENECK_KERNEL.md)准备插件 wheel，或克隆插件、应用补丁。
+然后在项目根目录运行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
 ```
 
-脚本会按 3.12 → 3.11 → 3.10 的顺序寻找解释器，创建项目独占的 `.venv`，安装依赖和项目，并执行 CLI 自检。指定解释器或同时安装测试依赖：
+脚本会按 3.13 → 3.12 → 3.11 → 3.10 的顺序寻找解释器，创建项目独占的 `.venv`，优先安装兼容本地 wheel，没有时从插件源码构建，并执行 CLI 自检。指定解释器或同时安装测试依赖：
 
 ```powershell
 .\scripts\bootstrap.ps1 -PythonExe "C:\Python311\python.exe" -Dev
@@ -46,6 +51,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
 只检查 Python 是否合格而不安装任何内容，可使用 `-CheckOnly`。
 
 脚本不会把依赖装进系统 Python，也不会删除已有数据或实验目录。
+
+已有项目环境需要检查或修复时，用可工作的基础 Python 运行 `setup_env.py`。
+它会跳过不可运行的解释器，并在重建前把旧 `.venv` 移至 `build/venv-backup-*`；
+健康的 uv 环境无需安装 pip，也不会重复重建。具体启动命令见 [START.md](START.md)。
 
 ## 4. 数据与配置放置
 
@@ -89,11 +98,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
 
 ## 6. 离线安装
 
-在一台具有相同 Windows 架构和 Python 小版本的联网机器上准备 wheelhouse：
+在联网构建机器上先生成插件 wheel，再准备 wheelhouse。以下命令以本地构建的
+Windows x64 / CPython 3.10+ abi3 wheel 为例：
 
 ```powershell
 python -m pip download -d wheelhouse `
-  "numpy>=1.24,<3" "pandas>=2,<4" "ripser>=0.6,<0.7" "topp==0.1.0" `
+  "numpy>=1.24,<3" "pandas>=2,<4" "polars==1.44.2" `
+  .\build\polars-tda-wheels\polars_tda-0.1.0-cp310-abi3-win_amd64.whl `
   "rich>=13,<14" "setuptools>=68" wheel
 ```
 
@@ -107,9 +118,11 @@ python -m pip download -d wheelhouse `
 
 ## 7. 常见失败
 
-- `No matching distribution found for ripser`：通常是 Python 版本、位数或平台没有对应 wheel；优先改用官方 64 位 Python 3.11 或 3.12。
-- `No matching distribution found for topp`：Topp 首发只提供 Windows x64 的 CPython 3.10–3.14 wheel；确认 Python 版本、系统位数和平台符合要求。
+- `No matching distribution found for polars-tda`：先准备本地插件克隆或本地 wheel；当前上游源码预览没有 PyPI 包，单独从索引安装不会成功。
+- `finite_bottleneck_distance` 导入失败：预览包未导出 Rust 距离绑定，需要发行时接入 [绑定补丁](../patches/polars-tda-finite-bottleneck.patch)。
 - `python/py 不是命令`：重新安装 Python Launcher，或通过 `-PythonExe` 指定完整路径。
+- `.venv` 解释器不可用：使用可工作的基础 Python 完整路径执行 `setup_env.py`，不要用已损坏的 `.venv` 启动修复脚本。
+- `No module named pip`：uv 环境可以没有 pip，使用 `uv pip install --python .venv\Scripts\python.exe ...`；这本身不表示运行环境损坏。
 - 预检报告 CSV 为 0：检查 `source_dir` 是配置文件相对路径还是绝对路径。
 - 文件契约错误：文件名必须带 SZ/SH，列名大小写必须与契约一致。
 - 内存压力大：优先调小 `topology_workers`；匹配阶段已改为 `mmap` 只读共享持续同调数据，进程数不会成倍放大内存。

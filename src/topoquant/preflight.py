@@ -93,7 +93,7 @@ def _existing_ancestor(path: Path) -> Path:
 
 def _dependency_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
-    for distribution in ("numpy", "pandas", "ripser", "topp", "rich"):
+    for distribution in ("numpy", "pandas", "polars", "polars-tda", "rich"):
         try:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
@@ -167,9 +167,20 @@ def inspect_environment(
         if versions[dependency] is None:
             errors.append(f"缺少运行依赖 {dependency}")
     if require_topology_backend:
-        for dependency in ("ripser", "topp"):
+        for dependency in ("polars", "polars-tda"):
             if versions[dependency] is None:
                 errors.append(f"缺少运行依赖 {dependency}")
+        if versions["polars"] is not None and versions["polars-tda"] is not None:
+            try:
+                from polars_tda import finite_bottleneck_distance, rips
+
+                if not callable(rips) or not callable(finite_bottleneck_distance):
+                    raise ImportError("rips/finite_bottleneck_distance 必须可调用")
+            except (ImportError, OSError) as exc:
+                errors.append(
+                    "polars-tda 内核接口不可用；需要包含 finite_bottleneck_distance "
+                    f"Rust 绑定的发行包（见 docs/BOTTLENECK_KERNEL.md）：{exc}"
+                )
 
     total_memory, available_memory = _memory_status()
     disk_probe = _existing_ancestor(config.work_dir)
